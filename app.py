@@ -189,7 +189,6 @@ def fetch_history(ticker: str, years: int = 25) -> pd.DataFrame:
 
 def compute_monthly_annual_returns_table(equity_series: pd.Series) -> pd.DataFrame:
     """Computes a table of monthly and annual returns (%) using 'ME' (Month End)."""
-    # Use 'ME' to ensure compatibility with modern Pandas versions (deprecating 'M')
     m_eq = equity_series.resample("ME").last()
     m_ret = m_eq.pct_change()
 
@@ -298,8 +297,8 @@ def run_backtest(
             long_ok = allow_long and long_cond
             short_ok = allow_short and short_cond
             if use_crsi_filter:
-                long_ok = long_ok and (not np.isnan(c_val) and c_val <= crsi_long_filter)
-                short_ok = short_ok and (not np.isnan(c_val) and c_val >= crsi_short_filter)
+                long_ok = long_ok and (not np.isnan(c_val) and c_val >= crsi_long_filter)
+                short_ok = short_ok and (not np.isnan(c_val) and c_val <= crsi_short_filter)
 
         if long_ok:
             return 1
@@ -344,7 +343,7 @@ def run_backtest(
                 return c > s
             elif exit_rule.startswith("3-Day Lowest Close"):
                 return c >= high_3[i]
-            elif exit_rule.startswith("5-Day Highest Close"):
+            elif exit_rule.startswith("5-Day Lowest Close"):
                 return c >= high_5[i]
             elif exit_rule.startswith("Fixed Holding Period"):
                 return bars_held >= exit_lookback_x
@@ -549,4 +548,4 @@ exit_lookback_x = st.sidebar.number_input("Exit Lookback (X Days)", min_value=2,
 # MAIN HEADER & DATA LOAD
 # -----------------------------------------------------------------------------
 st.title("📊 5-Day SMA Streak & Connors RSI Trading System")
-st.
+st.caption(f"Active Symbol: **{active_ticker
