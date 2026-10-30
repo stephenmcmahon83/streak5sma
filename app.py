@@ -186,11 +186,14 @@ def fetch_history(ticker: str, years: int = 25) -> pd.DataFrame:
     df.index = pd.to_datetime(df.index).tz_localize(None)
     return df
 
-
 def compute_monthly_annual_returns_table(equity_series: pd.Series) -> pd.DataFrame:
-    """Computes a table of monthly and annual returns (%) using 'ME' (Month End)."""
+    """Computes a stable table of monthly and annual returns (%) from an equity series."""
+    equity_series = equity_series.replace([np.inf, -np.inf], np.nan).ffill().bfill()
     m_eq = equity_series.resample("ME").last()
-    m_ret = m_eq.pct_change()
+    m_ret = m_eq.pct_change().fillna(0.0)
+    
+    # Clip extreme outlier percentages to prevent table distortion
+    m_ret = m_ret.clip(lower=-0.99, upper=5.0)
 
     df = pd.DataFrame({"ret": m_ret})
     df["year"] = df.index.year
@@ -205,13 +208,19 @@ def compute_monthly_annual_returns_table(equity_series: pd.Series) -> pd.DataFra
     for yr in pivot.index:
         yr_subset = equity_series[equity_series.index.year == yr]
         if len(yr_subset) >= 2:
-            ann_ret = ((yr_subset.iloc[-1] / yr_subset.iloc[0]) - 1.0) * 100.0
-            annual_rets.append(ann_ret)
+            start_val = yr_subset.iloc[0]
+            end_val = yr_subset.iloc[-1]
+            if start_val > 0:
+                ann_ret = ((end_val / start_val) - 1.0) * 100.0
+                annual_rets.append(max(min(ann_ret, 999.9), -99.9))
+            else:
+                annual_rets.append(0.0)
         else:
-            annual_rets.append(np.nan)
+            annual_rets.append(0.0)
 
     pivot["Annual (%)"] = annual_rets
-    return pivot.round(2)
+    return pivot.fillna(0.0).round(2)
+
 
 
 # -----------------------------------------------------------------------------
