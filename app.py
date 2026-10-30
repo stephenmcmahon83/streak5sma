@@ -681,4 +681,182 @@ with tab_bt:
         @st.cache_data(ttl=3600, show_spinner=False)
         def run_universe_batch_backtest(tickers: tuple, bt_yrs: int, t_side: str, e_style: str, s_mode: str, s_x: int, ex_x: int, crsi_flt: bool, c_l: float, c_s: float, ex_rule: str) -> pd.DataFrame:
             end_dt = dt.date.today() + dt.timedelta(days=1)
-            start_dt = end_dt - dt.timedelta(days=int(bt_yrs * 36
+            start_dt = end_dt - dt.timedelta(days=int(bt_yrs * 365.25) + 180)
+            try:
+                raw_batch = yf.download(list(tickers), start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True, group_by="ticker", progress=False, threads=True)
+            except Exception:
+                return pd.DataFrame()
+
+            rows = []
+            for tk in tickers:
+                try:
+                    if len(tickers) == 1:
+                        t_df = raw_batch.copy()
+                    else:
+                        if tk not in raw_batch.columns.get_level_values(0):
+                            continue
+                        t_df = raw_batch[tk].copy()
+
+                    t_df = t_df.dropna(subset=["Close", "Open"])
+                    if len(t_df) < 120:
+                        continue
+
+                    ind_df = enrich_indicators(t_df, sma_len=sma_period, exit_lookback_x=ex_x, cap_streak=cap_streak_mode)
+                    _, _, m = run_backtest(
+                        ind_df, backtest_years=bt_yrs, trade_side=t_side, entry_style=e_style,
+                        streak_match_mode=s_mode, streak_x=s_x, exit_lookback_x=ex_x,
+                        use_crsi_filter=crsi_flt, crsi_long_filter=c_l, crsi_short_filter=c_s, exit_rule=ex_rule
+                    )
+                    if m and m.get("Total Trades", 0) > 0:
+                        rows.append({
+                            "Ticker": tk,
+                            "Total Trades": m["Total Trades"],
+                            "Win Rate (%)": m["Win Rate (%)"],
+                            "Profit Factor": m["Profit Factor"],
+                            "CAGR (%)": m["CAGR (%)"],
+                            "Total Return (%)": m["Total Return (%)"],
+                            "Max Drawdown (%)": m["Max Drawdown (%)"],
+                            "Sharpe Ratio": m["Sharpe Ratio"],
+                            "Avg Trade (%)": m["Avg Trade (%)"],
+                            "Avg Days Held": m["Avg Days Held"],
+                        })
+                except Exception:
+                    continue
+            return pd.DataFrame(rows)
+
+        if st.button("🚀 Run Full Universe Batch Backtest", type="primary"):
+            with st.spinner(f"Backtesting {len(uni_tickers)} symbols over {backtest_years} years..."):
+                univ_results_df = run_universe_batch_backtest(
+                    tuple(uni_tickers), backtest_years, trade_side, entry_style, streak_match_mode,
+                    streak_x, exit_lookback_x, use_crsi_filter, crsi_long_thresh, crsi_short_thresh, selected_exit
+                )
+            if not univ_results_df.empty:
+                st.session_state["cached_univ_bt"] = univ_results_df
+            else:
+                st.warning("Batch backtest returned no records.")
+
+        if "cached_univ_bt" in st.session_state:
+            ub_df = st.session_state["cached_univ_bt"]
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                ub_sort = st.selectbox("Rank Leaderboard By", options=["CAGR (%)", "Sharpe Ratio", "Profit Factor", "Win Rate (%)", "Total Trades"], index=0)
+            with bc2:
+                ub_dir = st.radio("Leaderboard Order", options=["Descending (Best First)", "Ascending (Worst First)"], horizontal=True)
+
+            ub_df = ub_df.sort_values(by=ub_sort, ascending=ub_dir.startswith("Ascending")).reset_index(drop=True)
+            st.dataframe(ub_df, use_container_width=True, height=500, hide_index=True)
+        else:
+            st.info("Click **Run Full Universe Batch Backtest** above to generate performance rankings.")
+
+
+# =============================================================================
+# TAB 3: UNIVERSE SCANNER (EDGE ANALYSIS & FORWARD RETURNS)
+# =============================================================================
+with tab_scanner:
+    st.subheader("🌐 Full Stock Universe Scanner & Edge Analysis")
+    st.caption("Compare the **Average 5D Forward Return following the Current Streak** against the **Baseline Average 5D Forward Return (All Days)**.")
+
+    col_u1, col_u2 = st.columns([2, 2])
+    with col_u1:
+        selected_universe_preset = st.selectbox("Select Stock Universe", options=list(PRESET_UNIVERSES.keys()), index=2, key="scan_univ")
+    with col_u2:
+        max_symbols_cap = st.slider("Max Symbols to Batch Scan (0 = All)", min_value=0, max_value=550, value=505, key="scan_cap")
+
+    if selected_universe_preset == "S&P 500 (Full Universe)":
+        base_tickers = fetch_sp500_tickers()
+    else:
+        base_tickers = PRESET_UNIVERSES[selected_universe_preset]
+
+    scan_tickers = base_tickers[:max_symbols_cap] if max_symbols_cap > 0 else base_tickers
+    st.write(f"Loaded **{len(scan_tickers)} symbols** in universe `{selected_universe_preset}`.")
+
+    custom_universe_txt = st.text_area("Or Override with Custom Tickers (Comma-Separated)", value="", height=60, key="scan_custom")
+    if custom_universe_txt.strip():
+        scan_tickers = [t.strip().upper() for t in custom_universe_txt.split(",") if t.strip()]
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def run_full_universe_scan(tickers: tuple, sma_p: int, st_x: int, ex_x: int, cap_s: bool) -> pd.DataFrame:
+        end_dt = dt.date.today() + dt.timedelta(days=1)
+        start_dt = end_dt - dt.timedelta(days=365 * 3)
+        try:
+            raw_batch = yf.download(list(tickers), start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True, group_by="ticker", progress=False, threads=True)
+        except Exception:
+            return pd.DataFrame()
+
+        rows = []
+        for tk in tickers:
+            try:
+                if len(tickers) == 1:
+                    t_df = raw_batch.copy()
+                else:
+                    if tk not in raw_batch.columns.get_level_values(0):
+                        continue
+                    t_df = raw_batch[tk].copy()
+
+                t_df = t_df.dropna(subset=["Close", "Open"])
+                if len(t_df) < 120:
+                    continue
+
+                ind_df = enrich_indicators(t_df, sma_len=sma_p, exit_lookback_x=ex_x, cap_streak=cap_s)
+                last = ind_df.iloc[-1]
+                prev = ind_df.iloc[-2]
+                ret_1d = ((last["Close"] / prev["Close"]) - 1.0) * 100.0
+                st_val = int(last["SMA_Streak"]) if not np.isnan(last["SMA_Streak"]) else 0
+                crsi_2d_val = float(last["CRSI_2D_Avg"])
+
+                baseline_fwd_ret = float(ind_df["Fwd_5D_Return"].mean()) if "Fwd_5D_Return" in ind_df else np.nan
+                streak_history = ind_df[ind_df["SMA_Streak"] == st_val]
+                if not streak_history.empty and "Fwd_5D_Return" in streak_history:
+                    streak_fwd_ret = float(streak_history["Fwd_5D_Return"].mean())
+                    streak_fwd_display = f"{streak_fwd_ret:+.2f}%" if not np.isnan(streak_fwd_ret) else "no history"
+                else:
+                    streak_fwd_ret = np.nan
+                    streak_fwd_display = "no history"
+
+                if st_val <= -st_x:
+                    status = f"🟢 BUY (Streak = {st_val})"
+                elif st_val >= st_x:
+                    status = f"🔴 SHORT (Streak = +{st_val})"
+                else:
+                    status = "⚪ Neutral"
+
+                rows.append({
+                    "Ticker": tk,
+                    "Last Close": round(float(last["Close"]), 2),
+                    "1D Chg (%)": round(ret_1d, 2),
+                    f"{sma_p}-SMA Streak": st_val,
+                    "2-Day Avg CRSI": round(crsi_2d_val, 2),
+                    "Avg 5D Fwd Ret [Current Streak]": streak_fwd_display,
+                    "_raw_streak_fwd": streak_fwd_ret if not np.isnan(streak_fwd_ret) else -999.0,
+                    "Baseline Avg 5D Fwd Ret (All Days)": f"{baseline_fwd_ret:+.2f}%" if not np.isnan(baseline_fwd_ret) else "no history",
+                    "Signal for Tomorrow's Open": status,
+                })
+            except Exception:
+                continue
+        return pd.DataFrame(rows)
+
+    if st.button("🚀 Run Universe Batch Scan Now", type="primary"):
+        with st.spinner(f"Batch scanning {len(scan_tickers)} equities across Yahoo Finance..."):
+            scan_result_df = run_full_universe_scan(tuple(scan_tickers), sma_period, streak_x, exit_lookback_x, cap_streak_mode)
+        if not scan_result_df.empty:
+            st.session_state["cached_scan_df"] = scan_result_df
+        else:
+            st.warning("Batch scan returned no records.")
+
+    if "cached_scan_df" in st.session_state:
+        df_display = st.session_state["cached_scan_df"]
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            sort_metric = st.selectbox("Sort Table By", options=["_raw_streak_fwd", f"{sma_period}-SMA Streak", "2-Day Avg CRSI", "1D Chg (%)", "Ticker"], index=0, format_func=lambda x: "Avg 5D Fwd Ret [Current Streak]" if x == "_raw_streak_fwd" else x)
+        with sc2:
+            sort_dir = st.radio("Order", options=["Ascending", "Descending"], horizontal=True, index=1, key="scan_ord")
+
+        df_display = df_display.sort_values(by=sort_metric, ascending=(sort_dir == "Ascending")).reset_index(drop=True)
+        render_df = df_display.drop(columns=["_raw_streak_fwd"])
+
+        st.dataframe(
+            render_df, use_container_width=True, hide_index=True, height=620,
+            column_config={"2-Day Avg CRSI": st.column_config.ProgressColumn("2-Day Avg CRSI", format="%.1f", min_value=0, max_value=100)}
+        )
+    else:
+        st.info("Click **Run Universe Batch Scan Now** above to generate rankings across the S&P 500 / universe.")
