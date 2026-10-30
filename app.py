@@ -186,13 +186,12 @@ def fetch_history(ticker: str, years: int = 25) -> pd.DataFrame:
     df.index = pd.to_datetime(df.index).tz_localize(None)
     return df
 
+
 def compute_monthly_annual_returns_table(equity_series: pd.Series) -> pd.DataFrame:
-    """Computes a stable table of monthly and annual returns (%) from an equity series."""
+    """Computes a stable table of monthly and annual returns (%) using 'ME' (Month End)."""
     equity_series = equity_series.replace([np.inf, -np.inf], np.nan).ffill().bfill()
     m_eq = equity_series.resample("ME").last()
     m_ret = m_eq.pct_change().fillna(0.0)
-    
-    # Clip extreme outlier percentages to prevent table distortion
     m_ret = m_ret.clip(lower=-0.99, upper=5.0)
 
     df = pd.DataFrame({"ret": m_ret})
@@ -220,7 +219,6 @@ def compute_monthly_annual_returns_table(equity_series: pd.Series) -> pd.DataFra
 
     pivot["Annual (%)"] = annual_rets
     return pivot.fillna(0.0).round(2)
-
 
 
 # -----------------------------------------------------------------------------
@@ -733,7 +731,6 @@ with tab_bt:
             if not stock_dfs:
                 return pd.DataFrame(), pd.DataFrame(), {}
 
-            # Dynamic timeline: Use union of all timelines so shorter history stocks participate without truncating the 25y horizon
             master_index = None
             for tk, df in stock_dfs.items():
                 sub = df[df.index >= (df.index.max() - pd.DateOffset(years=bt_yrs))]
@@ -771,285 +768,4 @@ with tab_bt:
 
             ind_summary_df = pd.DataFrame(individual_rows)
 
-            port_equity = np.full(len(master_index), init_cap, dtype=float)
-            cash = init_cap
-            active_positions = []
-
-            for i in range(1, len(master_index)):
-                dt_curr = master_index[i]
-                remaining_positions = []
-                for pos in active_positions:
-                    tk = pos["Ticker"]
-                    df = stock_dfs[tk]
-                    if dt_curr not in df.index:
-                        remaining_positions.append(pos)
-                        continue
-
-                    row = df.loc[dt_curr]
-                    c_val = row["Close"]
-                    s_val = row["SMA"]
-                    h_x = row["Highest_Close_X"]
-                    l_x = row["Lowest_Close_X"]
-
-                    is_exit = False
-                    if pos["Direction"] == 1:
-                        if ex_rule.startswith("1st Close Above SMA") and c_val > s_val: is_exit = True
-                        elif ex_rule.startswith("X-Day Highest Close") and c_val >= h_x: is_exit = True
-                        elif ex_rule.startswith("1st Close Above SMA OR") and (c_val > s_val or c_val >= h_x): is_exit = True
-                        elif ex_rule.startswith("Fixed Holding Period") and (i - pos["entry_idx"]) >= ex_x: is_exit = True
-                    else:
-                        if ex_rule.startswith("1st Close Above SMA") and c_val < s_val: is_exit = True
-                        elif ex_rule.startswith("X-Day Highest Close") and c_val <= l_x: is_exit = True
-                        elif ex_rule.startswith("1st Close Above SMA OR") and (c_val < s_val or c_val <= l_x): is_exit = True
-                        elif ex_rule.startswith("Fixed Holding Period") and (i - pos["entry_idx"]) >= ex_x: is_exit = True
-
-                    if is_exit and i + 1 < len(master_index):
-                        next_dt = master_index[i+1]
-                        if next_dt in df.index:
-                            exit_open = df.loc[next_dt, "Open"]
-                            ret_frac = pos["Direction"] * ((exit_open - pos["entry_price"]) / pos["entry_price"])
-                            pnl = pos["allocated_capital"] * ret_frac - comm
-                            cash += pos["allocated_capital"] + pnl
-                        else:
-                            remaining_positions.append(pos)
-                    else:
-                        remaining_positions.append(pos)
-
-                active_positions = remaining_positions
-
-                available_slots = max_slots - len(active_positions)
-                if available_slots > 0 and cash > 5000:
-                    candidates = []
-                    for tk, df in stock_dfs.items():
-                        if any(p["Ticker"] == tk for p in active_positions):
-                            continue
-                        if dt_curr not in df.index:
-                            continue
-
-                        row = df.loc[dt_curr]
-                        st_val = row["SMA_Streak"]
-                        crsi_val = row["CRSI_2D_Avg"]
-                        if np.isnan(st_val):
-                            continue
-
-                        is_mean_rev = e_style.startswith("Mean Reversion")
-                        if is_mean_rev:
-                            long_ok = (t_side in ("Long Only", "Both (Long & Short)")) and (st_val <= -s_x)
-                            short_ok = (t_side in ("Short Only", "Both (Long & Short)")) and (st_val >= s_x)
-                        else:
-                            long_ok = (t_side in ("Long Only", "Both (Long & Short)")) and (st_val >= s_x)
-                            short_ok = (t_side in ("Short Only", "Both (Long & Short)")) and (st_val <= -s_x)
-
-                        if crsi_flt:
-                            if long_ok: long_ok = (not np.isnan(crsi_val) and crsi_val <= c_l)
-                            if short_ok: short_ok = (not np.isnan(crsi_val) and crsi_val >= c_s)
-
-                        if long_ok:
-                            candidates.append({"Ticker": tk, "direction": 1, "score": crsi_val})
-                        elif short_ok:
-                            candidates.append({"Ticker": tk, "direction": -1, "score": crsi_val})
-
-                    candidates = sorted(candidates, key=lambda x: x["score"] if x["direction"] == 1 else -x["score"])
-                    to_enter = candidates[:available_slots]
-
-                    slot_capital = cash / max(1, len(active_positions) + len(to_enter))
-                    for cand in to_enter:
-                        tk = cand["Ticker"]
-                        if i + 1 < len(master_index):
-                            next_dt = master_index[i+1]
-                            df = stock_dfs[tk]
-                            if next_dt in df.index:
-                                entry_open = df.loc[next_dt, "Open"]
-                                alloc = min(slot_capital, cash)
-                                if alloc > comm:
-                                    cash -= (alloc + comm)
-                                    active_positions.append({
-                                        "Ticker": tk,
-                                        "entry_price": entry_open,
-                                        "Direction": cand["direction"],
-                                        "allocated_capital": alloc,
-                                        "entry_idx": i+1
-                                    })
-
-                current_market_value = cash
-                for pos in active_positions:
-                    tk = pos["Ticker"]
-                    df = stock_dfs[tk]
-                    if dt_curr in df.index:
-                        curr_px = df.loc[dt_curr, "Close"]
-                        pos_val = pos["allocated_capital"] * (1.0 + pos["Direction"] * ((curr_px - pos["entry_price"]) / pos["entry_price"]))
-                        current_market_value += max(0.0, pos_val)
-                    else:
-                        current_market_value += pos["allocated_capital"]
-
-                port_equity[i] = current_market_value
-
-            port_df = pd.DataFrame({"Portfolio_Equity": port_equity}, index=master_index)
-            bench_ticker = "SPY" if "SPY" in stock_dfs else list(stock_dfs.keys())[0]
-            bench_close = stock_dfs[bench_ticker]["Close"].reindex(master_index).ffill().bfill()
-            port_df["BuyHold_Equity"] = init_cap * (bench_close / bench_close.iloc[0])
-
-            years_sim = max((master_index[-1] - master_index[0]).days / 365.25, 0.1)
-            port_cagr = (((port_df["Portfolio_Equity"].iloc[-1] / init_cap) ** (1.0 / years_sim)) - 1.0) * 100.0
-            bh_cagr = (((port_df["BuyHold_Equity"].iloc[-1] / init_cap) ** (1.0 / years_sim)) - 1.0) * 100.0
-            max_dd = (((port_df["Portfolio_Equity"] - port_df["Portfolio_Equity"].cummax()) / port_df["Portfolio_Equity"].cummax()) * 100.0).min()
-
-            port_metrics = {
-                "Portfolio CAGR (%)": round(port_cagr, 2),
-                "Benchmark CAGR (%)": round(bh_cagr, 2),
-                "Max Drawdown (%)": round(max_dd, 2),
-                "Final Portfolio Value ($)": round(port_df["Portfolio_Equity"].iloc[-1], 2),
-            }
-
-            return ind_summary_df, port_df, port_metrics
-
-        if st.button("🚀 Run Portfolio Simulation", type="primary"):
-            with st.spinner(f"Simulating multi-stock portfolio across {len(uni_tickers)} symbols (dynamic timelines)..."):
-                ind_df, port_df, p_metrics = run_portfolio_simulation(
-                    tuple(uni_tickers), backtest_years, trade_side, entry_style, streak_match_mode,
-                    streak_x, exit_lookback_x, use_crsi_filter, crsi_long_thresh, crsi_short_thresh, selected_exit,
-                    int(max_portfolio_slots), float(commission_per_trade), float(initial_capital)
-                )
-            if not port_df.empty:
-                st.session_state["cached_port_res"] = (ind_df, port_df, p_metrics)
-            else:
-                st.warning("Portfolio simulation returned no records.")
-
-        if "cached_port_res" in st.session_state:
-            ind_df, port_df, p_metrics = st.session_state["cached_port_res"]
-
-            st.markdown("### 🏆 Portfolio-Level Performance Summary")
-            pk1, pk2, pk3, pk4 = st.columns(4)
-            pk1.metric("Portfolio CAGR", f"{p_metrics.get('Portfolio CAGR (%)', 0):.2f}%", f"Benchmark: {p_metrics.get('Benchmark CAGR (%)', 0):.2f}%")
-            pk2.metric("Final Portfolio Value", f"${p_metrics.get('Final Portfolio Value ($)', 0):,.2f}")
-            pk3.metric("Max Portfolio Drawdown", f"{p_metrics.get('Max Drawdown (%)', 0):.2f}%")
-            pk4.metric("Starting Capital", f"${initial_capital:,.0f}")
-
-            peq_fig = go.Figure()
-            peq_fig.add_trace(go.Scatter(x=port_df.index, y=port_df["Portfolio_Equity"], mode="lines", name="Portfolio Strategy", line=dict(color="#00e676", width=2.2)))
-            peq_fig.add_trace(go.Scatter(x=port_df.index, y=port_df["BuyHold_Equity"], mode="lines", name="Benchmark (SPY/First)", line=dict(color="#90a4ae", width=1.5, dash="dot")))
-            peq_fig.update_layout(height=420, template="plotly_dark", hovermode="x unified", title=f"Portfolio Equity Growth (${initial_capital:,.0f} Initial Capital)", yaxis_title="Equity ($)")
-            st.plotly_chart(peq_fig, use_container_width=True)
-
-            st.subheader("📅 Portfolio Monthly & Annual Returns Matrix (%)")
-            port_returns_matrix = compute_monthly_annual_returns_table(port_df["Portfolio_Equity"])
-            if not port_returns_matrix.empty:
-                st.dataframe(port_returns_matrix, use_container_width=True)
-
-            st.markdown("### 📋 Individual Stock CAGRs & Performance Table")
-            st.dataframe(ind_df.sort_values(by="Strategy CAGR (%)", ascending=False), use_container_width=True, hide_index=True, height=450)
-        else:
-            st.info("Click **Run Portfolio Simulation** above to compute portfolio-level CAGR, equity curves, and returns tables.")
-
-
-# =============================================================================
-# TAB 3: UNIVERSE SCANNER (EDGE ANALYSIS & FORWARD RETURNS)
-# =============================================================================
-with tab_scanner:
-    st.subheader("🌐 Full Stock Universe Scanner & Edge Analysis")
-    st.caption("Compare the **Average 5D Forward Return following the Current Streak** against the **Baseline Average 5D Forward Return (All Days)**.")
-
-    col_u1, col_u2 = st.columns([2, 2])
-    with col_u1:
-        selected_universe_preset = st.selectbox("Select Stock Universe", options=list(PRESET_UNIVERSES.keys()), index=2, key="scan_univ")
-    with col_u2:
-        max_symbols_cap = st.slider("Max Symbols to Batch Scan (0 = All)", min_value=0, max_value=550, value=505, key="scan_cap")
-
-    if selected_universe_preset == "S&P 500 (Full Universe)":
-        base_tickers = fetch_sp500_tickers()
-    else:
-        base_tickers = PRESET_UNIVERSES[selected_universe_preset]
-
-    scan_tickers = base_tickers[:max_symbols_cap] if max_symbols_cap > 0 else base_tickers
-    st.write(f"Loaded **{len(scan_tickers)} symbols** in universe `{selected_universe_preset}`.")
-
-    custom_universe_txt = st.text_area("Or Override with Custom Tickers (Comma-Separated)", value="", height=60, key="scan_custom")
-    if custom_universe_txt.strip():
-        scan_tickers = [t.strip().upper() for t in custom_universe_txt.split(",") if t.strip()]
-
-    @st.cache_data(ttl=3600, show_spinner=False)
-    def run_full_universe_scan(tickers: tuple, sma_p: int, st_x: int, ex_x: int, cap_s: bool) -> pd.DataFrame:
-        end_dt = dt.date.today() + dt.timedelta(days=1)
-        start_dt = end_dt - dt.timedelta(days=365 * 3)
-        try:
-            raw_batch = yf.download(list(tickers), start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"), auto_adjust=True, group_by="ticker", progress=False, threads=True)
-        except Exception:
-            return pd.DataFrame()
-
-        rows = []
-        for tk in tickers:
-            try:
-                if len(tickers) == 1:
-                    t_df = raw_batch.copy()
-                else:
-                    if tk not in raw_batch.columns.get_level_values(0):
-                        continue
-                    t_df = raw_batch[tk].copy()
-
-                t_df = t_df.dropna(subset=["Close", "Open"])
-                if len(t_df) < 120:
-                    continue
-
-                ind_df = enrich_indicators(t_df, sma_len=sma_p, exit_lookback_x=ex_x, cap_streak=cap_s)
-                last = ind_df.iloc[-1]
-                prev = ind_df.iloc[-2]
-                ret_1d = ((last["Close"] / prev["Close"]) - 1.0) * 100.0
-                st_val = int(last["SMA_Streak"]) if not np.isnan(last["SMA_Streak"]) else 0
-                crsi_2d_val = float(last["CRSI_2D_Avg"])
-
-                baseline_fwd_ret = float(ind_df["Fwd_5D_Return"].mean()) if "Fwd_5D_Return" in ind_df else np.nan
-                streak_history = ind_df[ind_df["SMA_Streak"] == st_val]
-                if not streak_history.empty and "Fwd_5D_Return" in streak_history:
-                    streak_fwd_ret = float(streak_history["Fwd_5D_Return"].mean())
-                    streak_fwd_display = f"{streak_fwd_ret:+.2f}%" if not np.isnan(streak_fwd_ret) else "no history"
-                else:
-                    streak_fwd_ret = np.nan
-                    streak_fwd_display = "no history"
-
-                if st_val <= -st_x:
-                    status = f"🟢 BUY (Streak = {st_val})"
-                elif st_val >= st_x:
-                    status = f"🔴 SHORT (Streak = +{st_val})"
-                else:
-                    status = "⚪ Neutral"
-
-                rows.append({
-                    "Ticker": tk,
-                    "Last Close": round(float(last["Close"]), 2),
-                    "1D Chg (%)": round(ret_1d, 2),
-                    f"{sma_p}-SMA Streak": st_val,
-                    "2-Day Avg CRSI": round(crsi_2d_val, 2),
-                    "Avg 5D Fwd Ret [Current Streak]": streak_fwd_display,
-                    "_raw_streak_fwd": streak_fwd_ret if not np.isnan(streak_fwd_ret) else -999.0,
-                    "Baseline Avg 5D Fwd Ret (All Days)": f"{baseline_fwd_ret:+.2f}%" if not np.isnan(baseline_fwd_ret) else "no history",
-                    "Signal for Tomorrow's Open": status,
-                })
-            except Exception:
-                continue
-        return pd.DataFrame(rows)
-
-    if st.button("🚀 Run Universe Batch Scan Now", type="primary"):
-        with st.spinner(f"Batch scanning {len(scan_tickers)} equities across Yahoo Finance..."):
-            scan_result_df = run_full_universe_scan(tuple(scan_tickers), sma_period, streak_x, exit_lookback_x, cap_streak_mode)
-        if not scan_result_df.empty:
-            st.session_state["cached_scan_df"] = scan_result_df
-        else:
-            st.warning("Batch scan returned no records.")
-
-    if "cached_scan_df" in st.session_state:
-        df_display = st.session_state["cached_scan_df"]
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            sort_metric = st.selectbox("Sort Table By", options=["_raw_streak_fwd", f"{sma_period}-SMA Streak", "2-Day Avg CRSI", "1D Chg (%)", "Ticker"], index=0, format_func=lambda x: "Avg 5D Fwd Ret [Current Streak]" if x == "_raw_streak_fwd" else x)
-        with sc2:
-            sort_dir = st.radio("Order", options=["Ascending", "Descending"], horizontal=True, index=1, key="scan_ord")
-
-        df_display = df_display.sort_values(by=sort_metric, ascending=(sort_dir == "Ascending")).reset_index(drop=True)
-        render_df = df_display.drop(columns=["_raw_streak_fwd"])
-
-        st.dataframe(
-            render_df, use_container_width=True, hide_index=True, height=620,
-            column_config={"2-Day Avg CRSI": st.column_config.ProgressColumn("2-Day Avg CRSI", format="%.1f", min_value=0, max_value=100)}
-        )
-    else:
-        st.info("Click **Run Universe Batch Scan Now** above to generate rankings across the S&P 500 / universe.")
+            port_equity = np.full(len(master_index), init
