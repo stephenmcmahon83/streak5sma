@@ -163,7 +163,7 @@ def enrich_indicators(
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_history(ticker: str, years: int = 21) -> pd.DataFrame:
+def fetch_history(ticker: str, years: int = 25) -> pd.DataFrame:
     end_date = dt.date.today() + dt.timedelta(days=1)
     start_date = end_date - dt.timedelta(days=int(years * 365.25) + 150)
     raw = yf.download(
@@ -187,6 +187,33 @@ def fetch_history(ticker: str, years: int = 21) -> pd.DataFrame:
     return df
 
 
+def compute_monthly_annual_returns_table(equity_series: pd.Series) -> pd.DataFrame:
+    """Computes a table of monthly and annual returns (%) from an equity series."""
+    m_eq = equity_series.resample("M").last()
+    m_ret = m_eq.pct_change()
+
+    df = pd.DataFrame({"ret": m_ret})
+    df["year"] = df.index.year
+    df["month"] = df.index.strftime("%b")
+
+    pivot = df.pivot_table(index="year", columns="month", values="ret", aggfunc="first")
+    month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    existing_cols = [m for m in month_order if m in pivot.columns]
+    pivot = pivot[existing_cols] * 100.0
+
+    annual_rets = []
+    for yr in pivot.index:
+        yr_subset = equity_series[equity_series.index.year == yr]
+        if len(yr_subset) >= 2:
+            ann_ret = ((yr_subset.iloc[-1] / yr_subset.iloc[0]) - 1.0) * 100.0
+            annual_rets.append(ann_ret)
+        else:
+            annual_rets.append(np.nan)
+
+    pivot["Annual (%)"] = annual_rets
+    return pivot.round(2)
+
+
 # -----------------------------------------------------------------------------
 # BACKTEST ENGINE (SINGLE SYMBOL)
 # -----------------------------------------------------------------------------
@@ -205,7 +232,7 @@ EXIT_OPTIONS = [
 
 def run_backtest(
     df: pd.DataFrame,
-    backtest_years: int = 20,
+    backtest_years: int = 25,
     trade_side: str = "Both (Long & Short)",
     entry_style: str = "Mean Reversion (Long: Streak <= -X, Short: Streak >= +X)",
     streak_match_mode: str = "At Least X Days (|Streak| >= X)",
@@ -463,16 +490,19 @@ custom_ticker = st.sidebar.text_input(
 active_ticker = custom_ticker if custom_ticker else selected_ticker
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("1. Entry & Portfolio Size")
-sma_period = st.sidebar.number_input("SMA Period (Days)", min_value=2, max_value=50, value=5)
-streak_x = st.sidebar.number_input("Entry Streak Threshold (X Days)", min_value=1, max_value=20, value=5)
-streak_match_mode = st.sidebar.selectbox("Streak Trigger Condition", options=["At Least X Days (|Streak| >= X)", "Exact Xth Day Only (|Streak| == X)"], index=0)
-cap_streak_mode = st.sidebar.checkbox("Cap Streak Oscillator at ±SMA Period", value=False)
-
+st.sidebar.subheader("1. Capital & Portfolio Sizing")
+initial_capital = st.sidebar.number_input(
+    "Initial Portfolio Capital ($)",
+    min_value=10_000.0,
+    max_value=10_000_000.0,
+    value=100_000.0,
+    step=10_000.0,
+    help="Starting dollar size of the portfolio."
+)
 max_portfolio_slots = st.sidebar.number_input(
     "Max Portfolio Size (Max Concurrent Stocks)",
     min_value=1, max_value=50, value=5,
-    help="Limits how many simultaneous stock positions can be held in the portfolio."
+    help="Limits how many simultaneous stock positions can be held."
 )
 commission_per_trade = st.sidebar.number_input(
     "Commission ($ Per Trade Entry/Exit)",
@@ -480,7 +510,14 @@ commission_per_trade = st.sidebar.number_input(
     help="Fixed commission deducted in dollars per entry and exit fill."
 )
 
-backtest_years = st.sidebar.slider("Backtest Horizon (Years)", min_value=5, max_value=25, value=20)
+st.sidebar.markdown("---")
+st.sidebar.subheader("2. Entry Logic")
+sma_period = st.sidebar.number_input("SMA Period (Days)", min_value=2, max_value=50, value=5)
+streak_x = st.sidebar.number_input("Entry Streak Threshold (X Days)", min_value=1, max_value=20, value=5)
+streak_match_mode = st.sidebar.selectbox("Streak Trigger Condition", options=["At Least X Days (|Streak| >= X)", "Exact Xth Day Only (|Streak| == X)"], index=0)
+cap_streak_mode = st.sidebar.checkbox("Cap Streak Oscillator at ±SMA Period", value=False)
+
+backtest_years = st.sidebar.slider("Backtest Horizon (Years)", min_value=5, max_value=30, value=25)
 trade_side = st.sidebar.selectbox("System Direction", options=["Long Only", "Short Only", "Both (Long & Short)"], index=2)
 entry_style = st.sidebar.radio(
     "Strategy Mode",
@@ -502,7 +539,7 @@ else:
     crsi_long_thresh, crsi_short_thresh = 25.0, 75.0
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("2. Exit Logic")
+st.sidebar.subheader("3. Exit Logic")
 selected_exit = st.sidebar.selectbox("Primary Exit Rule", options=EXIT_OPTIONS, index=0)
 exit_lookback_x = st.sidebar.number_input("Exit Lookback (X Days)", min_value=2, max_value=30, value=int(streak_x))
 
@@ -511,10 +548,10 @@ exit_lookback_x = st.sidebar.number_input("Exit Lookback (X Days)", min_value=2,
 # MAIN HEADER & DATA LOAD
 # -----------------------------------------------------------------------------
 st.title("📊 5-Day SMA Streak & Connors RSI Trading System")
-st.caption(f"Active Symbol: **{active_ticker}** | Portfolio Slots: **{max_portfolio_slots}** | Commission: **${commission_per_trade}/trade**")
+st.caption(f"Active Symbol: **{active_ticker}** | Initial Capital: **${initial_capital:,.0f}** | Horizon: **{backtest_years} Years**")
 
 with st.spinner(f"Loading daily history for {active_ticker}..."):
-    raw_df = fetch_history(active_ticker, years=max(backtest_years + 2, 22))
+    raw_df = fetch_history(active_ticker, years=max(backtest_years + 2, 28))
 
 if raw_df.empty:
     st.error(f"Could not load historical data for `{active_ticker}`.")
@@ -533,6 +570,7 @@ bt_df, trades_df, metrics = run_backtest(
     crsi_long_filter=crsi_long_thresh,
     crsi_short_filter=crsi_short_thresh,
     exit_rule=selected_exit,
+    initial_capital=initial_capital,
     commission_per_trade=commission_per_trade,
 )
 
@@ -554,19 +592,19 @@ m6.metric("Next Open Status", metrics.get("Tomorrow_Action", "FLAT"))
 # -----------------------------------------------------------------------------
 tab_chart, tab_bt, tab_scanner = st.tabs(
     [
-        "📈 5-Year Chart & Streak Oscillator",
+        "📈 Chart & Full Backtest Horizon",
         f"🧪 {backtest_years}-Year Portfolio & Universe Backtest",
         "🌐 Universe Scanner (Edge Analysis & Forward Returns)",
     ]
 )
 
 # =============================================================================
-# TAB 1: 5-YEAR DAILY CANDLESTICK CHART
+# TAB 1: 5-YEAR / FULL HORIZON DAILY CANDLESTICK CHART
 # =============================================================================
 with tab_chart:
     c_top1, c_top2, c_top3 = st.columns([2, 2, 2])
     with c_top1:
-        chart_years = st.slider("Chart Lookback (Years)", min_value=1, max_value=10, value=5)
+        chart_years = st.slider("Chart Lookback (Years)", min_value=1, max_value=backtest_years, value=min(5, backtest_years))
     with c_top2:
         show_trade_markers = st.checkbox("Overlay Trade Fills", value=True)
     with c_top3:
@@ -610,12 +648,12 @@ with tab_chart:
 
 
 # =============================================================================
-# TAB 2: PORTFOLIO BACKTEST & UNIVERSE LEADERBOARD
+# TAB 2: PORTFOLIO BACKTEST & MONTHLY/ANNUAL RETURNS TABLE
 # =============================================================================
 with tab_bt:
-    st.subheader(f"🧪 Portfolio & Universe Backtest Engine")
+    st.subheader(f"🧪 {backtest_years}-Year Backtest & Performance Matrix")
     st.markdown(
-        f"Configured with **Max {max_portfolio_slots} Portfolio Slots** and **${commission_per_trade} Commission per Trade Fill**."
+        f"Initial Capital: **${initial_capital:,.0f}** | Max Slots: **{max_portfolio_slots}** | Commission: **${commission_per_trade}/trade**"
     )
 
     bt_mode = st.radio("Backtest Mode", options=["Single Symbol Details", "Full Universe Multi-Stock Portfolio Backtest"], horizontal=True)
@@ -624,7 +662,7 @@ with tab_bt:
         st.markdown(f"**Active Symbol:** `{active_ticker}` | **Exit Rule:** `{selected_exit}`")
         k1, k2, k3, k4, k5, k6 = st.columns(6)
         k1.metric("Strategy CAGR", f"{metrics.get('CAGR (%)', 0):.2f}%", f"B&H: {metrics.get('Buy & Hold CAGR (%)', 0):.2f}%")
-        k2.metric("Total Return", f"{metrics.get('Total Return (%)', 0):,.1f}%")
+        k2.metric("Ending Equity", f"${bt_df['Strategy_Equity'].iloc[-1]:,.2f}")
         k3.metric("Win Rate", f"{metrics.get('Win Rate (%)', 0):.1f}%", f"{metrics.get('Total Trades', 0)} Trades")
         k4.metric("Profit Factor", f"{metrics.get('Profit Factor', 0):.2f}")
         k5.metric("Max Drawdown", f"{metrics.get('Max Drawdown (%)', 0):.2f}%")
@@ -633,25 +671,15 @@ with tab_bt:
         eq_fig = go.Figure()
         eq_fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["Strategy_Equity"], mode="lines", name="Strategy", line=dict(color="#00e676", width=2)))
         eq_fig.add_trace(go.Scatter(x=bt_df.index, y=bt_df["BuyHold_Equity"], mode="lines", name="Buy & Hold", line=dict(color="#90a4ae", width=1.5, dash="dot")))
-        eq_fig.update_layout(height=400, template="plotly_dark", hovermode="x unified", yaxis_title="Equity ($)")
+        eq_fig.update_layout(height=420, template="plotly_dark", hovermode="x unified", title=f"Full {backtest_years}-Year Equity Growth (${initial_capital:,.0f} Initial Capital)", yaxis_title="Equity ($)")
         st.plotly_chart(eq_fig, use_container_width=True)
 
-        st.subheader("🔄 Exit Strategy Comparison")
-        exit_comparison_rows = []
-        for ex_opt in EXIT_OPTIONS:
-            _, _, ex_m = run_backtest(
-                full_df, backtest_years=backtest_years, trade_side=trade_side, entry_style=entry_style,
-                streak_match_mode=streak_match_mode, streak_x=streak_x, exit_lookback_x=exit_lookback_x,
-                use_crsi_filter=use_crsi_filter, crsi_long_filter=crsi_long_thresh, crsi_short_filter=crsi_short_thresh,
-                exit_rule=ex_opt, commission_per_trade=commission_per_trade
-            )
-            if ex_m:
-                row_data = {"Exit System": ex_opt.replace("X-Day", f"{exit_lookback_x}-Day").replace("X Days", f"{exit_lookback_x} Days")}
-                row_data.update(ex_m)
-                exit_comparison_rows.append(row_data)
-
-        if exit_comparison_rows:
-            st.dataframe(pd.DataFrame(exit_comparison_rows)[["Exit System", "Total Trades", "Win Rate (%)", "Avg Trade (%)", "Profit Factor", "CAGR (%)", "Max Drawdown (%)", "Sharpe Ratio"]], use_container_width=True, hide_index=True)
+        st.subheader("📅 Monthly & Annual Returns Matrix (%)")
+        returns_matrix = compute_monthly_annual_returns_table(bt_df["Strategy_Equity"])
+        if not returns_matrix.empty:
+            st.dataframe(returns_matrix, use_container_width=True)
+        else:
+            st.info("Insufficient history for monthly returns breakdown.")
 
         st.subheader("📋 Trade Execution Log")
         if not trades_df.empty:
@@ -672,10 +700,10 @@ with tab_bt:
             uni_tickers = PRESET_UNIVERSES[univ_preset]
 
         uni_tickers = uni_tickers[:univ_cap] if univ_cap > 0 else uni_tickers
-        st.write(f"Universe Loaded: **{len(uni_tickers)} symbols** | Portfolio Slots: **{max_portfolio_slots}** | Commission: **${commission_per_trade}/trade**")
+        st.write(f"Universe Loaded: **{len(uni_tickers)} symbols** | Portfolio Slots: **{max_portfolio_slots}** | Capital: **${initial_capital:,.0f}**")
 
         @st.cache_data(ttl=3600, show_spinner=False)
-        def run_portfolio_simulation(tickers: tuple, bt_yrs: int, t_side: str, e_style: str, s_mode: str, s_x: int, ex_x: int, crsi_flt: bool, c_l: float, c_s: float, ex_rule: str, max_slots: int, comm: float) -> tuple:
+        def run_portfolio_simulation(tickers: tuple, bt_yrs: int, t_side: str, e_style: str, s_mode: str, s_x: int, ex_x: int, crsi_flt: bool, c_l: float, c_s: float, ex_rule: str, max_slots: int, comm: float, init_cap: float) -> tuple:
             end_dt = dt.date.today() + dt.timedelta(days=1)
             start_dt = end_dt - dt.timedelta(days=int(bt_yrs * 365.25) + 180)
             try:
@@ -696,7 +724,6 @@ with tab_bt:
             if not stock_dfs:
                 return pd.DataFrame(), pd.DataFrame(), {}
 
-            # Build unified common calendar index
             common_index = None
             for tk, df in stock_dfs.items():
                 sub = df[df.index >= (df.index.max() - pd.DateOffset(years=bt_yrs))]
@@ -709,7 +736,6 @@ with tab_bt:
             if len(common_index) < 30:
                 return pd.DataFrame(), pd.DataFrame(), {}
 
-            # Run individual backtests to get trade logs and individual CAGRs
             individual_rows = []
             all_trades = []
             for tk, df in stock_dfs.items():
@@ -718,7 +744,7 @@ with tab_bt:
                     sub_df, backtest_years=bt_yrs, trade_side=t_side, entry_style=e_style,
                     streak_match_mode=s_mode, streak_x=s_x, exit_lookback_x=ex_x,
                     use_crsi_filter=crsi_flt, crsi_long_filter=c_l, crsi_short_filter=c_s, exit_rule=ex_rule,
-                    commission_per_trade=comm
+                    commission_per_trade=comm, initial_capital=init_cap
                 )
                 if m and m.get("Total Trades", 0) > 0:
                     individual_rows.append({
@@ -735,20 +761,13 @@ with tab_bt:
                         all_trades.append(t_df)
 
             ind_summary_df = pd.DataFrame(individual_rows)
-            combined_trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
-            # Simulate Portfolio Level Equity Curve with Slot Allocation & Commission
-            initial_capital = 100_000.0
-            port_equity = np.full(len(common_index), initial_capital, dtype=float)
-            cash = initial_capital
-            active_positions = [] # list of dicts: Ticker, entry_open, direction, size_capital
+            port_equity = np.full(len(common_index), init_cap, dtype=float)
+            cash = init_cap
+            active_positions = []
 
-            # Daily simulation loop
             for i in range(1, len(common_index)):
                 dt_curr = common_index[i]
-                dt_prev = common_index[i-1]
-
-                # 1. Check exits for active positions
                 remaining_positions = []
                 for pos in active_positions:
                     tk = pos["Ticker"]
@@ -758,7 +777,6 @@ with tab_bt:
                     h_x = df.loc[dt_curr, "Highest_Close_X"]
                     l_x = df.loc[dt_curr, "Lowest_Close_X"]
 
-                    # Evaluate exit condition at close of today
                     is_exit = False
                     if pos["Direction"] == 1:
                         if ex_rule.startswith("1st Close Above SMA") and c_val > s_val: is_exit = True
@@ -772,7 +790,6 @@ with tab_bt:
                         elif ex_rule.startswith("Fixed Holding Period") and (i - pos["entry_idx"]) >= ex_x: is_exit = True
 
                     if is_exit and i + 1 < len(common_index):
-                        # Exit at next open
                         exit_open = stock_dfs[tk].loc[common_index[i+1], "Open"]
                         ret_frac = pos["Direction"] * ((exit_open - pos["entry_price"]) / pos["entry_price"])
                         pnl = pos["allocated_capital"] * ret_frac - comm
@@ -782,7 +799,6 @@ with tab_bt:
 
                 active_positions = remaining_positions
 
-                # 2. Check new entries if slots available
                 available_slots = max_slots - len(active_positions)
                 if available_slots > 0 and cash > 5000:
                     candidates = []
@@ -814,7 +830,6 @@ with tab_bt:
                         elif short_ok:
                             candidates.append({"Ticker": tk, "direction": -1, "score": crsi_val})
 
-                    # Sort candidates by conviction score (lowest CRSI for longs, highest for shorts)
                     candidates = sorted(candidates, key=lambda x: x["score"] if x["direction"] == 1 else -x["score"])
                     to_enter = candidates[:available_slots]
 
@@ -834,7 +849,6 @@ with tab_bt:
                                     "entry_idx": i+1
                                 })
 
-                # 3. Mark to market portfolio equity
                 current_market_value = cash
                 for pos in active_positions:
                     tk = pos["Ticker"]
@@ -845,12 +859,11 @@ with tab_bt:
                 port_equity[i] = current_market_value
 
             port_df = pd.DataFrame({"Portfolio_Equity": port_equity}, index=common_index)
-            port_df["BuyHold_Equity"] = initial_capital * (stock_dfs[list(stock_dfs.keys())[0]].loc[common_index, "Close"] / stock_dfs[list(stock_dfs.keys())[0]].loc[common_index, "Close"].iloc[0])
+            port_df["BuyHold_Equity"] = init_cap * (stock_dfs[list(stock_dfs.keys())[0]].loc[common_index, "Close"] / stock_dfs[list(stock_dfs.keys())[0]].loc[common_index, "Close"].iloc[0])
 
-            # Calculate portfolio metrics
             years_sim = max((common_index[-1] - common_index[0]).days / 365.25, 0.1)
-            port_cagr = (((port_df["Portfolio_Equity"].iloc[-1] / initial_capital) ** (1.0 / years_sim)) - 1.0) * 100.0
-            bh_cagr = (((port_df["BuyHold_Equity"].iloc[-1] / initial_capital) ** (1.0 / years_sim)) - 1.0) * 100.0
+            port_cagr = (((port_df["Portfolio_Equity"].iloc[-1] / init_cap) ** (1.0 / years_sim)) - 1.0) * 100.0
+            bh_cagr = (((port_df["BuyHold_Equity"].iloc[-1] / init_cap) ** (1.0 / years_sim)) - 1.0) * 100.0
             max_dd = (((port_df["Portfolio_Equity"] - port_df["Portfolio_Equity"].cummax()) / port_df["Portfolio_Equity"].cummax()) * 100.0).min()
 
             port_metrics = {
@@ -867,7 +880,7 @@ with tab_bt:
                 ind_df, port_df, p_metrics = run_portfolio_simulation(
                     tuple(uni_tickers), backtest_years, trade_side, entry_style, streak_match_mode,
                     streak_x, exit_lookback_x, use_crsi_filter, crsi_long_thresh, crsi_short_thresh, selected_exit,
-                    int(max_portfolio_slots), float(commission_per_trade)
+                    int(max_portfolio_slots), float(commission_per_trade), float(initial_capital)
                 )
             if not port_df.empty:
                 st.session_state["cached_port_res"] = (ind_df, port_df, p_metrics)
@@ -882,19 +895,23 @@ with tab_bt:
             pk1.metric("Portfolio CAGR", f"{p_metrics.get('Portfolio CAGR (%)', 0):.2f}%", f"Benchmark: {p_metrics.get('Benchmark CAGR (%)', 0):.2f}%")
             pk2.metric("Final Portfolio Value", f"${p_metrics.get('Final Portfolio Value ($)', 0):,.2f}")
             pk3.metric("Max Portfolio Drawdown", f"{p_metrics.get('Max Drawdown (%)', 0):.2f}%")
-            pk4.metric("Portfolio Slots / Comm", f"{max_portfolio_slots} Slots | ${commission_per_trade}")
+            pk4.metric("Starting Capital", f"${initial_capital:,.0f}")
 
-            # Portfolio Equity Curve
             peq_fig = go.Figure()
             peq_fig.add_trace(go.Scatter(x=port_df.index, y=port_df["Portfolio_Equity"], mode="lines", name="Portfolio Strategy", line=dict(color="#00e676", width=2.2)))
             peq_fig.add_trace(go.Scatter(x=port_df.index, y=port_df["BuyHold_Equity"], mode="lines", name="Benchmark (First Ticker)", line=dict(color="#90a4ae", width=1.5, dash="dot")))
-            peq_fig.update_layout(height=420, template="plotly_dark", hovermode="x unified", title="Portfolio Equity Growth ($100,000 Initial Capital)", yaxis_title="Equity ($)")
+            peq_fig.update_layout(height=420, template="plotly_dark", hovermode="x unified", title=f"Portfolio Equity Growth (${initial_capital:,.0f} Initial Capital)", yaxis_title="Equity ($)")
             st.plotly_chart(peq_fig, use_container_width=True)
+
+            st.subheader("📅 Portfolio Monthly & Annual Returns Matrix (%)")
+            port_returns_matrix = compute_monthly_annual_returns_table(port_df["Portfolio_Equity"])
+            if not port_returns_matrix.empty:
+                st.dataframe(port_returns_matrix, use_container_width=True)
 
             st.markdown("### 📋 Individual Stock CAGRs & Performance Table")
             st.dataframe(ind_df.sort_values(by="Strategy CAGR (%)", ascending=False), use_container_width=True, hide_index=True, height=450)
         else:
-            st.info("Click **Run Portfolio Simulation** above to compute portfolio-level CAGR, equity curves, and individual stock metrics.")
+            st.info("Click **Run Portfolio Simulation** above to compute portfolio-level CAGR, equity curves, and returns tables.")
 
 
 # =============================================================================
