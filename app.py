@@ -16,7 +16,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Pre-defined Universe Presets
 PRESET_UNIVERSES = {
     "Major Indices & Core ETFs": [
         "^GSPC", "^DJI", "^RUT", "^NDX",
@@ -36,7 +35,7 @@ PRESET_UNIVERSES = {
         "SIRI", "SNPS", "SNOW", "SPLK", "STM", "STX", "TEAM", "TMUS", "TSLA", "TTD",
         "TTWO", "TXN", "VRSK", "VRTX", "WBA", "WBD", "WDAY", "XEL", "ZS"
     ],
-    "S&P 500 (Full Universe)": [], # Dynamically loaded below via Wikipedia/GitHub
+    "S&P 500 (Full Universe)": [],
     "Russell 2000 (Sample Liquid)": [
         "IWM", "AA", "AMC", "ARRY", "BCPC", "BLBD", "CACI", "CALM", "CAR", "CBT",
         "CCK", "CONN", "CROX", "CVI", "CWEN", "DNOW", "EEX", "ENR", "EXLS", "FIBK",
@@ -48,17 +47,13 @@ PRESET_UNIVERSES = {
 
 @st.cache_data(ttl=86400)
 def fetch_sp500_tickers() -> list:
-    """Fetches the live list of S&P 500 components from GitHub/Wikipedia."""
     try:
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
         df = pd.read_csv(url)
         if "Symbol" in df.columns:
-            # Replace dots with hyphens for yfinance compatibility (e.g. BRK.B -> BRK-B)
-            symbols = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-            return symbols
+            return df["Symbol"].str.replace(".", "-", regex=False).tolist()
     except Exception:
         pass
-    # Fallback default S&P 500 subset if offline
     return ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "JPM", "V", "UNH", "XOM", "JNJ", "MA", "PG", "HD"]
 
 
@@ -161,8 +156,7 @@ def enrich_indicators(
     df["Highest_Close_5"] = df["Close"].rolling(5).max()
     df["Lowest_Close_5"] = df["Close"].rolling(5).min()
 
-    # 5-Day Forward Return assuming entry at next bar's open: Open[t+5] / Open[t+1] - 1
-    # Shift open forward by 1 for entry, shift close forward by 5 for exit
+    # 5-Day Forward Return: Open[t+5] / Open[t+1] - 1
     next_open = df["Open"].shift(-1)
     future_open_5 = df["Open"].shift(-6)
     df["Fwd_5D_Return"] = ((future_open_5 / next_open) - 1.0) * 100.0
@@ -523,7 +517,7 @@ exit_lookback_x = st.sidebar.number_input("Exit Lookback (X Days)", min_value=2,
 # MAIN HEADER & DATA LOAD
 # -----------------------------------------------------------------------------
 st.title("📊 5-Day SMA Streak & Connors RSI Trading System")
-st.caption(f"Active Symbol: **{active_ticker}** | Universe Scanner with S&P 500 / Nasdaq 100 Support & Forward Return Analytics")
+st.caption(f"Active Symbol: **{active_ticker}** | Universe Scanner with Edge Analysis (Streak vs Baseline 5D Forward Returns)")
 
 with st.spinner(f"Loading daily history for {active_ticker}..."):
     raw_df = fetch_history(active_ticker, years=max(backtest_years + 2, 22))
@@ -567,7 +561,7 @@ tab_chart, tab_bt, tab_scanner = st.tabs(
     [
         "📈 5-Year Chart & Streak Oscillator",
         f"🧪 {backtest_years}-Year Backtest & All-Exits Matrix",
-        "🌐 Universe Scanner (S&P 500 / Full Universes & Forward Returns)",
+        "🌐 Universe Scanner (Edge Analysis & Forward Returns)",
     ]
 )
 
@@ -647,14 +641,13 @@ with tab_bt:
 
 
 # =============================================================================
-# TAB 3: UNIVERSE SCANNER (ENTIRE S&P 500 / NASDAQ 100 + FORWARD RETURNS)
+# TAB 3: UNIVERSE SCANNER (EDGE ANALYSIS & FORWARD RETURNS)
 # =============================================================================
 with tab_scanner:
-    st.subheader("🌐 Full Stock Universe Scanner & Forward Return Matrix")
+    st.subheader("🌐 Full Stock Universe Scanner & Edge Analysis")
     st.caption(
-        "Scan entire stock indices (S&P 500, Nasdaq 100, Russell 2000). "
-        "Shows current streak values, 2-Day Avg Connors RSI, and the historical **Average 5-Day Forward Return** "
-        "when entering at the next open following that streak value."
+        "Compare the **Average 5D Forward Return following the Current Streak** against the **Baseline Average 5D Forward Return (All Days)** "
+        "to evaluate whether the streak provides a predictive trading edge."
     )
 
     col_u1, col_u2 = st.columns([2, 2])
@@ -662,25 +655,19 @@ with tab_scanner:
         selected_universe_preset = st.selectbox(
             "Select Stock Universe",
             options=list(PRESET_UNIVERSES.keys()),
-            index=2 # Default to S&P 500 Full Universe
+            index=2
         )
     with col_u2:
         max_symbols_cap = st.slider("Max Symbols to Batch Scan (0 = All)", min_value=0, max_value=550, value=505)
 
-    # Resolve universe symbols
     if selected_universe_preset == "S&P 500 (Full Universe)":
         base_tickers = fetch_sp500_tickers()
     else:
         base_tickers = PRESET_UNIVERSES[selected_universe_preset]
 
-    if max_symbols_cap > 0:
-        scan_tickers = base_tickers[:max_symbols_cap]
-    else:
-        scan_tickers = base_tickers
-
+    scan_tickers = base_tickers[:max_symbols_cap] if max_symbols_cap > 0 else base_tickers
     st.write(f"Loaded **{len(scan_tickers)} symbols** in universe `{selected_universe_preset}`.")
 
-    # Optional manual custom override textarea
     custom_universe_txt = st.text_area("Or Override with Custom Tickers (Comma-Separated)", value="", height=60)
     if custom_universe_txt.strip():
         scan_tickers = [t.strip().upper() for t in custom_universe_txt.split(",") if t.strip()]
@@ -688,9 +675,7 @@ with tab_scanner:
     @st.cache_data(ttl=3600, show_spinner=False)
     def run_full_universe_scan(tickers: tuple, sma_p: int, st_x: int, ex_x: int, cap_s: bool) -> pd.DataFrame:
         end_dt = dt.date.today() + dt.timedelta(days=1)
-        start_dt = end_dt - dt.timedelta(days=365 * 3) # 3 years for reliable historical forward return averaging
-        
-        # Batch download via yfinance
+        start_dt = end_dt - dt.timedelta(days=365 * 3)
         try:
             raw_batch = yf.download(
                 list(tickers),
@@ -725,10 +710,17 @@ with tab_scanner:
                 st_val = int(last["SMA_Streak"]) if not np.isnan(last["SMA_Streak"]) else 0
                 crsi_2d_val = float(last["CRSI_2D_Avg"])
 
-                # Calculate historical average 5-day forward return for THIS specific streak value
-                # e.g., filter historical occurrences where SMA_Streak == st_val
+                # Baseline average 5D forward return across all historical bars
+                baseline_fwd_ret = float(ind_df["Fwd_5D_Return"].mean()) if "Fwd_5D_Return" in ind_df else np.nan
+
+                # Streak-specific average 5D forward return
                 streak_history = ind_df[ind_df["SMA_Streak"] == st_val]
-                avg_fwd_ret = float(streak_history["Fwd_5D_Return"].mean()) if not streak_history.empty else np.nan
+                if not streak_history.empty and "Fwd_5D_Return" in streak_history:
+                    streak_fwd_ret = float(streak_history["Fwd_5D_Return"].mean())
+                    streak_fwd_display = f"{streak_fwd_ret:+.2f}%" if not np.isnan(streak_fwd_ret) else "no history"
+                else:
+                    streak_fwd_ret = np.nan
+                    streak_fwd_display = "no history"
 
                 if st_val <= -st_x:
                     status = f"🟢 BUY (Streak = {st_val})"
@@ -744,7 +736,9 @@ with tab_scanner:
                         "1D Chg (%)": round(ret_1d, 2),
                         f"{sma_p}-SMA Streak": st_val,
                         "2-Day Avg CRSI": round(crsi_2d_val, 2),
-                        "Avg 5D Fwd Ret (%) [Current Streak]": round(avg_fwd_ret, 2) if not np.isnan(avg_fwd_ret) else 0.0,
+                        "Avg 5D Fwd Ret [Current Streak]": streak_fwd_display,
+                        "_raw_streak_fwd": streak_fwd_ret if not np.isnan(streak_fwd_ret) else -999.0,
+                        "Baseline Avg 5D Fwd Ret (All Days)": f"{baseline_fwd_ret:+.2f}%" if not np.isnan(baseline_fwd_ret) else "no history",
                         "Signal for Tomorrow's Open": status,
                     }
                 )
@@ -754,13 +748,13 @@ with tab_scanner:
         return pd.DataFrame(rows)
 
     if st.button("🚀 Run Universe Batch Scan Now", type="primary"):
-        with st.spinner(f"Batch scanning {len(scan_tickers)} equities across Yahoo Finance... (This takes ~15-30 seconds for S&P 500)"):
+        with st.spinner(f"Batch scanning {len(scan_tickers)} equities across Yahoo Finance... (Takes ~15-30s for S&P 500)"):
             scan_result_df = run_full_universe_scan(tuple(scan_tickers), sma_period, streak_x, exit_lookback_x, cap_streak_mode)
 
         if not scan_result_df.empty:
             st.session_state["cached_scan_df"] = scan_result_df
         else:
-            st.warning("Batch scan returned no records. Check network connectivity.")
+            st.warning("Batch scan returned no records.")
 
     if "cached_scan_df" in st.session_state:
         df_display = st.session_state["cached_scan_df"]
@@ -770,30 +764,29 @@ with tab_scanner:
             sort_metric = st.selectbox(
                 "Sort Table By",
                 options=[
+                    "_raw_streak_fwd",
                     f"{sma_period}-SMA Streak",
-                    "Avg 5D Fwd Ret (%) [Current Streak]",
                     "2-Day Avg CRSI",
                     "1D Chg (%)",
                     "Ticker",
                 ],
                 index=0,
+                format_func=lambda x: "Avg 5D Fwd Ret [Current Streak]" if x == "_raw_streak_fwd" else x
             )
         with sc2:
             sort_dir = st.radio("Order", options=["Ascending", "Descending"], horizontal=True, index=1)
 
         df_display = df_display.sort_values(by=sort_metric, ascending=(sort_dir == "Ascending")).reset_index(drop=True)
 
+        # Drop internal sorting helper before displaying
+        render_df = df_display.drop(columns=["_raw_streak_fwd"])
+
         st.dataframe(
-            df_display,
+            render_df,
             use_container_width=True,
             hide_index=True,
             height=620,
             column_config={
-                "Avg 5D Fwd Ret (%) [Current Streak]": st.column_config.NumberColumn(
-                    "Avg 5D Fwd Ret (%)",
-                    help="Historical average 5-day forward return following this exact streak value",
-                    format="%+.2f%%",
-                ),
                 "2-Day Avg CRSI": st.column_config.ProgressColumn(
                     "2-Day Avg CRSI",
                     format="%.1f",
